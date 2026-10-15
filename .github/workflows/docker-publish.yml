@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing vX.Y.Z tag to publish"
+        description: "vX.Y.Z version label to publish (built from latest master)"
         required: true
         type: string
       promote_latest:
@@ -24,7 +24,8 @@ concurrency:
   queue: max
 
 env:
-  DOCKERHUB_IMAGE: decolua/9router
+  # Branch the image is always built from. The release tag is only a version label.
+  SOURCE_REF: master
 
 jobs:
   prepare:
@@ -38,18 +39,17 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
-      publish_dockerhub: ${{ steps.release.outputs.publish_dockerhub }}
       promote_latest: ${{ steps.release.outputs.promote_latest }}
       ghcr_image: ${{ steps.release.outputs.ghcr_image }}
 
     steps:
-      - name: Check out release tag
+      - name: Check out latest master
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.release_tag || github.ref_name }}
+          ref: ${{ env.SOURCE_REF }}
           fetch-depth: 1
 
-      - name: Validate tag and package versions
+      - name: Validate tag format and resolve master commit
         id: release
         env:
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -90,21 +90,17 @@ jobs:
             }
           }
 
+          // Source is always latest master; package.json versions may differ from the tag.
           const rootVersion = require("./package.json").version;
           const cliVersion = require("./cli/package.json").version;
-
           if (rootVersion !== version) {
-            console.error(`package.json version ${rootVersion} does not match tag ${tag}`);
-            process.exit(1);
+            console.log(`::warning::package.json version ${rootVersion} differs from tag ${tag} (building master anyway)`);
           }
-
           if (cliVersion !== version) {
-            console.error(`cli/package.json version ${cliVersion} does not match tag ${tag}`);
-            process.exit(1);
+            console.log(`::warning::cli/package.json version ${cliVersion} differs from tag ${tag} (building master anyway)`);
           }
 
           const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-          const publishDockerHub = process.env.REPOSITORY === "decolua/9router";
           const ghcrImage = `ghcr.io/${process.env.REPOSITORY.toLowerCase()}`;
           const isPrerelease = version.includes("-");
           const promoteLatest = (process.env.EVENT_NAME === "push" && !isPrerelease)
@@ -114,11 +110,10 @@ jobs:
           fs.appendFileSync(output, `tag=${tag}\n`);
           fs.appendFileSync(output, `version=${version}\n`);
           fs.appendFileSync(output, `commit=${commit}\n`);
-          fs.appendFileSync(output, `publish_dockerhub=${publishDockerHub}\n`);
           fs.appendFileSync(output, `promote_latest=${promoteLatest}\n`);
           fs.appendFileSync(output, `ghcr_image=${ghcrImage}\n`);
 
-          console.log(`Validated ${tag} at ${commit}`);
+          console.log(`Labeling master@${commit} as ${tag}`);
           console.log(`latest promotion: ${promoteLatest ? "enabled" : "disabled"}`);
           NODE
 
@@ -341,55 +336,28 @@ jobs:
           docker logs "$container" || true
           exit 1
 
-      - name: Log in to Docker Hub
-        if: needs.prepare.outputs.publish_dockerhub == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Publish version image to Docker Hub
-        if: needs.prepare.outputs.publish_dockerhub == 'true'
+      - name: Record published version and latest promotion policy
         env:
-          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+          PROMOTE_LATEST: ${{ needs.prepare.outputs.promote_latest }}
           GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          set -euo pipefail
-          docker buildx imagetools create \
-            --tag "${DOCKERHUB_IMAGE}:${VERSION}" \
-            "${GHCR_IMAGE}:${VERSION}"
-
-          docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:${VERSION}" | tee "$RUNNER_TEMP/dockerhub-version-manifest.txt"
-          docker buildx imagetools inspect --raw "${DOCKERHUB_IMAGE}:${VERSION}" > "$RUNNER_TEMP/dockerhub-version-manifest.json"
-
-          expected=$'linux/amd64\nlinux/arm64'
-          actual="$(jq -r '[.manifests[] | select(.platform != null and .platform.os != null and .platform.architecture != null) | "\(.platform.os)/\(.platform.architecture)"] | sort | .[]' "$RUNNER_TEMP/dockerhub-version-manifest.json")"
-          if [[ "$actual" != "$expected" ]]; then
-            echo "Docker Hub version manifest platforms do not match exactly:" >&2
-            printf '%s\n' "$actual" >&2
-            exit 1
-          fi
-
-      - name: Record latest promotion policy
-        env:
-          PROMOTE_LATEST: ${{ needs.prepare.outputs.promote_latest }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          if [[ "$PROMOTE_LATEST" == "true" ]]; then
-            echo "### Latest promotion" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Policy: promote \`latest\` after the verified ${VERSION} manifest." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### Latest promotion" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Policy: leave \`latest\` unchanged; this is a numbered-tag-only manual republish." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "### Published Docker images"
+            echo "- GHCR: \`${GHCR_IMAGE}:${VERSION}\`"
+            echo ""
+            echo "### Latest promotion"
+            if [[ "$PROMOTE_LATEST" == "true" ]]; then
+              echo "- Policy: promote \`latest\` after the verified ${VERSION} manifest."
+            else
+              echo "- Policy: leave \`latest\` unchanged; this is a numbered-tag-only manual republish."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Promote verified version to latest
         if: needs.prepare.outputs.promote_latest == 'true'
         env:
-          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
           GHCR_IMAGE: ${{ env.GHCR_IMAGE }}
-          PUBLISH_DOCKERHUB: ${{ needs.prepare.outputs.publish_dockerhub }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
@@ -397,12 +365,6 @@ jobs:
           docker buildx imagetools create \
             --tag "${GHCR_IMAGE}:latest" \
             "${GHCR_IMAGE}:${VERSION}"
-
-          if [[ "$PUBLISH_DOCKERHUB" == "true" ]]; then
-            docker buildx imagetools create \
-              --tag "${DOCKERHUB_IMAGE}:latest" \
-              "${GHCR_IMAGE}:${VERSION}"
-          fi
 
           docker buildx imagetools inspect "${GHCR_IMAGE}:latest" | tee "$RUNNER_TEMP/ghcr-latest-manifest.txt"
           docker buildx imagetools inspect --raw "${GHCR_IMAGE}:latest" > "$RUNNER_TEMP/ghcr-latest-manifest.json"
@@ -415,23 +377,4 @@ jobs:
             exit 1
           fi
 
-          if [[ "$PUBLISH_DOCKERHUB" == "true" ]]; then
-            docker buildx imagetools inspect "${DOCKERHUB_IMAGE}:latest" | tee "$RUNNER_TEMP/dockerhub-latest-manifest.txt"
-            docker buildx imagetools inspect --raw "${DOCKERHUB_IMAGE}:latest" > "$RUNNER_TEMP/dockerhub-latest-manifest.json"
-            actual="$(jq -r '[.manifests[] | select(.platform != null and .platform.os != null and .platform.architecture != null) | "\(.platform.os)/\(.platform.architecture)"] | sort | .[]' "$RUNNER_TEMP/dockerhub-latest-manifest.json")"
-            if [[ "$actual" != "$expected" ]]; then
-              echo "Docker Hub latest manifest platforms do not match exactly:" >&2
-              printf '%s\n' "$actual" >&2
-              exit 1
-            fi
-          fi
-
-          {
-            echo "### Published Docker images"
-            echo "- GHCR: \`${GHCR_IMAGE}:${VERSION}\`"
-            echo "- GHCR latest: \`${GHCR_IMAGE}:latest\`"
-            if [[ "$PUBLISH_DOCKERHUB" == "true" ]]; then
-              echo "- Docker Hub: \`${DOCKERHUB_IMAGE}:${VERSION}\`"
-              echo "- Docker Hub latest: \`${DOCKERHUB_IMAGE}:latest\`"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "- GHCR latest: \`${GHCR_IMAGE}:latest\`" >> "$GITHUB_STEP_SUMMARY"
