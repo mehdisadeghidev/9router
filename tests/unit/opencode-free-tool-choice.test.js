@@ -1,12 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import { PROVIDERS } from "../../open-sse/config/providers.js";
-import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
-import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
 import { OPENCODE_FINGERPRINT_TOOLS } from "../../open-sse/utils/opencodeFingerprint.js";
 
+const { fetchMock } = vi.hoisted(() => {
+  process.env.EGRESS_PROBE_MODE = "off";
+  return { fetchMock: vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => "" } })) };
+});
+
 vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
-  proxyAwareFetch: vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => "" } })),
+  proxyAwareFetch: fetchMock,
 }));
+
+// The executor carries its own transport, so the network has to be stubbed
+// there; leaving the real client in place sends this test to opencode.ai.
+vi.mock("../../open-sse/services/opencodeTlsClient.js", () => ({
+  opencodeTlsFetch: (url, init) => fetchMock(url, init),
+  isOpencodeTlsAvailable: async () => true,
+  resetOpencodeTlsSession: () => {},
+  OpencodeTlsUnavailableError: class OpencodeTlsUnavailableError extends Error {},
+}));
+
+import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
 
 // Break caught: opencode/muse-spark-1.3-contributor-free 400 vì upstream
 // chỉ nhận tool_choice "auto"; named/required/none phải demote sang "auto".
@@ -75,7 +89,7 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
   });
 
   it("wire: execute gửi choice auto tới /inference/v1/responses", async () => {
-    proxyAwareFetch.mockClear();
+    fetchMock.mockClear();
     const ex = new OpenCodeExecutor();
     const body = responsesBody(FREE_13, { type: "function", name: "get_weather" });
     const { url, transformedBody } = await ex.execute({
@@ -83,8 +97,8 @@ describe("opencode Free 1.3 tool_choice auto-only", () => {
     });
     expect(url).toBe("https://opencode.ai/inference/v1/responses");
     expect(transformedBody.tool_choice).toBe("auto");
-    expect(proxyAwareFetch).toHaveBeenCalledTimes(1);
-    const [actualUrl, actualInit] = proxyAwareFetch.mock.calls[0];
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [actualUrl, actualInit] = fetchMock.mock.calls[0];
     expect(actualUrl).toBe("https://opencode.ai/inference/v1/responses");
     const sent = JSON.parse(actualInit.body);
     expect(sent.tool_choice).toBe("auto");

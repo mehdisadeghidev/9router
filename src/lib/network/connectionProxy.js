@@ -55,6 +55,10 @@ function normalizeLegacyProxy(providerSpecificData = {}) {
   };
 }
 
+/**
+ * Map a stored proxy pool onto the unified proxy payload.
+ * Relay types rewrite the base URL and travel as `vercelRelayUrl`.
+ */
 export function proxyConfigFromPool(proxyPool) {
   if (!proxyPool || proxyPool.isActive !== true) return null;
 
@@ -117,6 +121,7 @@ export async function resolveConnectionProxyConfig(
       const proxyPool = await getProxyPoolById(proxyPoolId);
 
       const proxyUrl = normalizeString(proxyPool?.proxyUrl);
+      const noProxy = normalizeString(proxyPool?.noProxy);
 
       const isValidPool =
         proxyPool &&

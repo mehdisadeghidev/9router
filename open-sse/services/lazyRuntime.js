@@ -30,9 +30,19 @@ function isModuleMissing(error) {
   return code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND";
 }
 
+function ensureRuntimeManifest() {
+  const dir = getRuntimeDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const manifest = path.join(dir, "package.json");
+  if (!fs.existsSync(manifest)) {
+    fs.writeFileSync(manifest, JSON.stringify({ name: "9router-runtime", private: true }, null, 2));
+  }
+  return manifest;
+}
+
 function npmInstall(pkg, version) {
   const cwd = getRuntimeDir();
-  fs.mkdirSync(cwd, { recursive: true });
+  ensureRuntimeManifest();
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
   const args = ["install", "--no-audit", "--no-fund", "--prefer-online", `${pkg}@${version}`];
   return new Promise((resolve) => {

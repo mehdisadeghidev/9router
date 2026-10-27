@@ -5,6 +5,9 @@ import { normalizeString, resolveEffectiveProxyUrl } from "./proxyResolution.js"
 export const DIRECT_EGRESS_ID = "direct";
 
 const cooldowns = new Map();
+// A cooling egress is probed at a growing interval instead of waiting out the
+// whole Retry-After, so a recovered address is usable again within minutes.
+const probes = new Map();
 const directIpCache = {
   ip: null,
   at: 0,
@@ -238,9 +241,49 @@ export function markEgressCooling(egress, retryAfterMs) {
   const existing = cooldowns.get(egress.id);
   if (existing && existing.until >= until) return existing;
 
-  const entry = { until, retryAfterMs: ms, markedAt: Date.now() };
+  const markedAt = Date.now();
+  // A repeated refusal keeps the probe count, so the backoff keeps growing
+  // instead of restarting at the first interval on every failed probe.
+  const probeCount = existing?.probeCount || 0;
+  const entry = { until, retryAfterMs: ms, markedAt, probeCount };
   cooldowns.set(egress.id, entry);
+  probes.set(egress.id, markedAt + probeDelay(probeCount));
   return entry;
+}
+
+function probeDelay(probeCount) {
+  return Math.min(
+    EGRESS_CONFIG.recheckIntervalMs * 2 ** Math.max(0, probeCount - 1),
+    EGRESS_CONFIG.maxRecheckIntervalMs
+  );
+}
+
+/**
+ * True when a cooling egress is due for one real attempt. The interval doubles
+ * per attempt up to maxRecheckIntervalMs, so a limited address costs at most a
+ * handful of requests.
+ */
+export function isEgressProbeDue(egressOrId, now = Date.now()) {
+  const id = typeof egressOrId === "string" ? egressOrId : egressOrId?.id;
+  if (!id) return false;
+
+  const entry = cooldowns.get(id);
+  if (!entry || entry.until <= now) return false;
+
+  const nextAt = probes.get(id) ?? entry.markedAt + probeDelay(entry.probeCount || 0);
+  if (now < nextAt) return false;
+
+  entry.probeCount = (entry.probeCount || 0) + 1;
+  probes.set(id, now + probeDelay(entry.probeCount));
+  return true;
+}
+
+/** A request on this egress succeeded: it is healthy, drop every mark. */
+export function clearEgressCooldown(egressOrId) {
+  const id = typeof egressOrId === "string" ? egressOrId : egressOrId?.id;
+  if (!id) return false;
+  probes.delete(id);
+  return cooldowns.delete(id);
 }
 
 export function getEgressCooldown(egressOrId, now = Date.now()) {
@@ -489,6 +532,7 @@ export function describeEgress(egress) {
 
 export function resetEgressState() {
   cooldowns.clear();
+  probes.clear();
   directIpCache.ip = null;
   directIpCache.at = 0;
   directIpCache.lastProbeAt = 0;

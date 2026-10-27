@@ -51,9 +51,11 @@ describe("Antigravity quota-aware routing", () => {
     try {
       await expect(handleAntigravityQuotaError("ag-a", 429, MODEL, "token", {}))
         .resolves.toBe(Date.parse(FUTURE_RESET));
-      expect(getAntigravityQuotaCache().get("ag-a")[MODEL]).toEqual({
+      expect(getAntigravityQuotaCache().get("ag-a")[MODEL]).toMatchObject({
         remainingPercentage: 0,
         resetAt: FUTURE_RESET,
+        // Capped separately, so the pair is re-checked well before this reset.
+        effectiveResetAt: "2026-08-26T00:05:00.000Z",
       });
     } finally {
       vi.useRealTimers();
@@ -360,3 +362,85 @@ describe("Antigravity quota-aware routing", () => {
       vi.useRealTimers();
     }
   });
+
+// A quota reading is a snapshot, not a promise. Upstream advertises the reset of
+// the window it sampled, which can be days out; the same bug shape as the egress
+// cooldown (a cached 429 that nothing could ever disprove). The block must expire
+// so the next request re-reads the quota instead of trusting the old reading.
+describe("Antigravity quota blocks expire instead of trusting the reset", () => {
+  const FAR_RESET = "2026-09-01T00:00:00.000Z"; // ~6 days after the clock below
+  const START = new Date("2026-08-26T00:00:00.000Z");
+
+  it("caps a far-future reset so the pair is re-checked, keeping the real reset for reporting", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 0, resetAt: FAR_RESET },
+    } });
+
+    try {
+      const reset = await handleAntigravityQuotaError("ag-far", 429, MODEL, "token", {});
+      // The upstream number is still reported honestly to the client.
+      expect(reset).toBe(Date.parse(FAR_RESET));
+
+      const cached = getAntigravityQuotaCache().get("ag-far")[MODEL];
+      expect(cached.resetAt).toBe(FAR_RESET);
+      // But the block itself is capped at the recheck horizon.
+      expect(Date.parse(cached.effectiveResetAt)).toBeLessThan(Date.parse(FAR_RESET));
+      expect(Date.parse(cached.effectiveResetAt) - START.getTime()).toBeLessThanOrEqual(5 * 60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets the account back into rotation once the cap passes, while the advertised reset is still future", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 0, resetAt: FAR_RESET },
+    } });
+
+    try {
+      await handleAntigravityQuotaError("ag-expire", 429, MODEL, "token", {});
+      mocks.getProviderConnections.mockResolvedValue([
+        { id: "ag-expire", email: "expire@example.com", isActive: true },
+      ]);
+
+      // Inside the cap: still skipped.
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect((await getProviderCredentials("antigravity", null, MODEL)).allRateLimited).toBe(true);
+
+      // Past the cap, but days before the advertised reset: served again.
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(await getProviderCredentials("antigravity", null, MODEL)).toMatchObject({
+        connectionId: "ag-expire",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still honours a reset inside the cap unchanged", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const soon = new Date(START.getTime() + 2 * 60_000).toISOString();
+    mocks.getAntigravityUsage.mockResolvedValue({ quotas: {
+      [MODEL]: { remainingPercentage: 0, resetAt: soon },
+    } });
+
+    mocks.getProviderConnections.mockResolvedValue([
+      { id: "ag-soon", email: "soon@example.com", isActive: true },
+    ]);
+
+    try {
+      await handleAntigravityQuotaError("ag-soon", 429, MODEL, "token", {});
+      const cached = getAntigravityQuotaCache().get("ag-soon")[MODEL];
+      expect(cached.effectiveResetAt).toBe(soon);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect((await getProviderCredentials("antigravity", null, MODEL)).allRateLimited).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

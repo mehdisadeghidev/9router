@@ -124,11 +124,14 @@ describe("egress cooldowns", () => {
     expect(getEgressCooldown(egress.id, Date.now() + 121_000)).toBeNull();
   });
 
+  // A long Retry-After used to pin the egress for the whole window. It is
+  // capped at 30 minutes, the same ceiling the model lock uses, and the probe
+  // rechecks it long before that.
   it("clamps cooldowns to the configured bounds", () => {
     const egress = identifyFixedEgress(TARGET, pool("a", "http://proxy.example:8080"));
 
     expect(markEgressCooling(egress, 1).retryAfterMs).toBeGreaterThanOrEqual(1000);
-    expect(markEgressCooling(egress, 10 * 24 * 60 * 60 * 1000).retryAfterMs).toBe(24 * 60 * 60 * 1000);
+    expect(markEgressCooling(egress, 10 * 24 * 60 * 60 * 1000).retryAfterMs).toBe(30 * 60 * 1000);
   });
 
   it("never cools an unconfirmed direct egress", () => {

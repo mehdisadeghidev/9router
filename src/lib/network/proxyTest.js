@@ -1,4 +1,5 @@
 import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { isSocksProxyUrl, socksFetch } from "../../../open-sse/utils/socksTunnel.js";
 
 const DEFAULT_TEST_URL = "https://google.com/";
 const DEFAULT_TIMEOUT_MS = 8000;
@@ -38,17 +39,20 @@ export async function testProxyUrl({ proxyUrl, testUrl, timeoutMs } = {}) {
       ? Math.min(timeoutMsRaw, 30000)
       : DEFAULT_TIMEOUT_MS;
 
+  const socks = isSocksProxyUrl(normalizedProxyUrl);
   let dispatcher;
 
   try {
-    try {
-      dispatcher = new ProxyAgent({ uri: normalizedProxyUrl });
-    } catch (err) {
-      return {
-        ok: false,
-        status: 400,
-        error: `Invalid proxy URL: ${err?.message || String(err)}`,
-      };
+    if (!socks) {
+      try {
+        dispatcher = new ProxyAgent({ uri: normalizedProxyUrl });
+      } catch (err) {
+        return {
+          ok: false,
+          status: 400,
+          error: `Invalid proxy URL: ${err?.message || String(err)}`,
+        };
+      }
     }
 
     const controller = new AbortController();
@@ -56,14 +60,22 @@ export async function testProxyUrl({ proxyUrl, testUrl, timeoutMs } = {}) {
     const timer = setTimeout(() => controller.abort(), normalizedTimeoutMs);
 
     try {
-      const res = await undiciFetch(normalizedTestUrl, {
-        method: "HEAD",
-        dispatcher,
-        signal: controller.signal,
-        headers: {
-          "User-Agent": "9Router",
-        },
-      });
+      const res = socks
+        ? await socksFetch(normalizedTestUrl, {
+          method: "HEAD",
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "9Router",
+          },
+        }, normalizedProxyUrl)
+        : await undiciFetch(normalizedTestUrl, {
+          method: "HEAD",
+          dispatcher,
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "9Router",
+          },
+        });
 
       return {
         ok: res.ok,

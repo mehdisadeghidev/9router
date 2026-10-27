@@ -9,9 +9,13 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
   proxyAwareFetch: fetchMock,
 }));
 
-vi.mock("../../open-sse/utils/opencodeTransport.js", () => ({
-  fetchViaTransport: vi.fn(async () => null),
-  resetTransport: vi.fn(),
+// The executor carries its own transport, so the network has to be stubbed
+// there; the real client would send these tests to opencode.ai.
+vi.mock("../../open-sse/services/opencodeTlsClient.js", () => ({
+  opencodeTlsFetch: (url, init) => fetchMock(url, init),
+  isOpencodeTlsAvailable: async () => true,
+  resetOpencodeTlsSession: () => {},
+  OpencodeTlsUnavailableError: class OpencodeTlsUnavailableError extends Error {},
 }));
 
 import { getExecutor } from "../../open-sse/executors/index.js";
@@ -79,25 +83,15 @@ describe("OpenCode Free Session ID Format", () => {
     }
   });
 
-  // Upstream decodes the prefix as ~(time * 0x1000 + counter): it answers 403
-  // FreeTierError for a large counter and 429 FreeUsageLimitError when the
-  // decoded clock is far from the request time, so both fields must stay real.
-  function counterOf(id) {
-    return Number(~BigInt(`0x${id.slice(4, 16)}`) & 0xfffn);
-  }
-
-  function sessionClock(id) {
-    const raw = ~BigInt(`0x${id.slice(4, 16)}`) & ((1n << 48n) - 1n);
-    return Number(raw >> 12n);
-  }
-
+  // Upstream decodes the prefix as ~(time * 0x1000 + counter) and answers
+  // 403 FreeTierError unless the counter is small; hash-filled prefixes failed.
   it("encodes a small counter in session prefixes so the free-tier gate accepts them", () => {
+    const counterOf = (id) => Number(~BigInt(`0x${id.slice(4, 16)}`) & 0xfffn);
     for (const translate of [translateSessionId, translateZenSessionId]) {
       for (const raw of ["claude:550e8400-e29b-41d4-a716-446655440000", "session-from-codex", "", "x".repeat(300)]) {
         const translated = translate(raw, "claude");
         expect(translated).toMatch(OPENCODE_SESSION_RE);
-        expect(counterOf(translated)).toBeGreaterThanOrEqual(1);
-        expect(counterOf(translated)).toBeLessThanOrEqual(16);
+        expect(counterOf(translated)).toBe(1);
         expect(translate(raw, "claude")).toBe(translated);
       }
     }
@@ -105,13 +99,27 @@ describe("OpenCode Free Session ID Format", () => {
     expect(counterOf(generateZenSessionId(1_700_000_000_000))).toBe(1);
   });
 
-  it("stamps translated sessions with the current clock", () => {
-    const now = Date.now() % 2 ** 36;
-    for (const raw of ["clock-hint-a", "clock-hint-b", "clock-hint-c"]) {
-      const translated = translateSessionId(raw, "codex");
-      expect(translated).toMatch(OPENCODE_SESSION_RE);
-      expect(Math.abs(sessionClock(translated) - now)).toBeLessThan(60_000);
-    }
+  // Upstream decodes the prefix timestamp and refuses a session minted outside
+  // its free-tier window.
+  it("mints translated sessions at the current time instead of from a digest", () => {
+    // The prefix carries 36 bits of milliseconds plus a 12-bit counter.
+
+    const TIME_MASK = (1n << 36n) - 1n;
+    const timeOf = (id) => Number((~BigInt(`0x${id.slice(4, 16)}`) & ((1n << 48n) - 1n)) >> 12n);
+    const before = Date.now();
+    const translated = translateSessionId(`fresh-${before}`, "claude");
+    const after = Date.now();
+
+    expect(timeOf(translated)).toBeGreaterThanOrEqual(Number(BigInt(before) & TIME_MASK));
+    expect(timeOf(translated)).toBeLessThanOrEqual(Number(BigInt(after) & TIME_MASK));
+  });
+
+  it("reuses the memoized session for one conversation", () => {
+    const raw = "claude:memoized-conversation";
+    const first = translateSessionId(raw, "claude");
+    expect(translateSessionId(raw, "claude")).toBe(first);
+    // A different conversation still gets its own session.
+    expect(translateSessionId(`${raw}-other`, "claude")).not.toBe(first);
   });
 
   it("preserves already-valid OpenCode sessions without re-hashing", () => {
@@ -283,6 +291,22 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(forKey("user-A")).toMatch(OPENCODE_SESSION_RE);
   });
 
+  it("exposes the stable session helper directly", () => {
+    const first = stableSessionId({ connectionId: "direct-conn" });
+    expect(stableSessionId({ connectionId: "direct-conn" })).toBe(first);
+    expect(first).toMatch(OPENCODE_SESSION_RE);
+  });
+
+  it("keeps the standalone buildHeaders session stable across calls", () => {
+    const executor = getExecutor("opencode");
+    const first = executor.buildHeaders({})["x-opencode-session"];
+    const second = executor.buildHeaders({})["x-opencode-session"];
+    expect(first).toMatch(OPENCODE_SESSION_RE);
+    expect(second).toBe(first);
+  });
+
+  // chatCore substitutes a generated conversation id when the client sends
+  // none; that seed is not a real session hint.
   it("ignores the synthetic UUID plus timestamp seed chatCore sends", () => {
     const executor = getExecutor("opencode");
     const body = { messages: [{ role: "user", content: "hello" }] };
@@ -323,22 +347,9 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     const second = call("8a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d1792940000001");
 
     expect(second).toBe(first);
+    // The prefix carries 36 bits of milliseconds plus a 12-bit counter.
     const clock = Number((~BigInt(`0x${first.slice(4, 16)}`) & ((1n << 48n) - 1n)) >> 12n);
     expect(Math.abs(clock - (Date.now() % 2 ** 36))).toBeLessThan(60_000);
-  });
-
-  it("exposes the stable session helper directly", () => {
-    const first = stableSessionId({ connectionId: "direct-conn" });
-    expect(stableSessionId({ connectionId: "direct-conn" })).toBe(first);
-    expect(first).toMatch(OPENCODE_SESSION_RE);
-  });
-
-  it("keeps the standalone buildHeaders session stable across calls", () => {
-    const executor = getExecutor("opencode");
-    const first = executor.buildHeaders({})["x-opencode-session"];
-    const second = executor.buildHeaders({})["x-opencode-session"];
-    expect(first).toMatch(OPENCODE_SESSION_RE);
-    expect(second).toBe(first);
   });
 
   it("rotates the stable session after a 429 and retries the request once", async () => {
@@ -394,6 +405,8 @@ describe("OpenCode Stable Session Reuse (429 follow-up)", () => {
     expect(result.response.status).toBe(200);
   });
 
+  // A client that speaks the native protocol owns its session, so the 429
+  // passes through instead of rotating.
   it("keeps a native client session after a 429", async () => {
     const executor = getExecutor("opencode");
     const native = generateSessionId();

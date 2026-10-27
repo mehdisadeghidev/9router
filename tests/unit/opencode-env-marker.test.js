@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
-import {
-  OPENCODE_ENV_MARKER,
-  applyFingerprintSystemPrompt,
-} from "../../open-sse/utils/opencodeFingerprint.js";
+import { applyEnvFingerprint } from "../../open-sse/utils/opencodeFingerprint.js";
 import { OpenCodeExecutor } from "../../open-sse/executors/opencode.js";
 
 const WORKDIR_LINE = "Working directory:";
+const ROOT_LINE = "Workspace root folder:";
 
 function envCount(text) {
   return String(text || "").split("<env>").length - 1;
@@ -25,98 +23,110 @@ function responsesBody(overrides = {}) {
   };
 }
 
-describe("applyFingerprintSystemPrompt", () => {
+describe("applyEnvFingerprint", () => {
   it("declares the workspace root next to the working directory", () => {
-    expect(OPENCODE_ENV_MARKER).toContain(WORKDIR_LINE);
-    expect(OPENCODE_ENV_MARKER).toContain("Workspace root folder:");
-  });
-
-  it("upgrades an older block that only declared the working directory", () => {
-    const body = chatBody({
-      messages: [
-        { role: "system", content: "Custom prompt\n\n<env>\n  Working directory: /workspace\n</env>" },
-        { role: "user", content: "hi" },
-      ],
-    });
-    applyFingerprintSystemPrompt(body);
-    expect(envCount(body.messages[0].content)).toBe(1);
-    expect(body.messages[0].content).toContain("Workspace root folder:");
+    const body = chatBody();
+    applyEnvFingerprint(body, false);
+    const system = body.messages[0].content;
+    expect(system).toContain(WORKDIR_LINE);
+    expect(system).toContain(ROOT_LINE);
+    expect(system).toContain("</env>");
   });
 
   it("adds a system message carrying the env block when the chat body has none", () => {
     const body = chatBody();
-    applyFingerprintSystemPrompt(body);
+    expect(applyEnvFingerprint(body, false)).toBe(true);
     expect(body.messages).toHaveLength(2);
     expect(body.messages[0].role).toBe("system");
-    expect(body.messages[0].content).toBe(OPENCODE_ENV_MARKER);
+    expect(body.messages[0].content).toContain("<env>");
     expect(body.messages[1]).toEqual({ role: "user", content: "hi" });
-    expect(body.messages[0].content).toContain(WORKDIR_LINE);
   });
 
   it("appends the env block to an existing string system message", () => {
-    const body = chatBody({ messages: [{ role: "system", content: "You are helpful." }, { role: "user", content: "hi" }] });
-    applyFingerprintSystemPrompt(body);
+    const body = chatBody({
+      messages: [{ role: "system", content: "You are helpful." }, { role: "user", content: "hi" }],
+    });
+    applyEnvFingerprint(body, false);
     expect(body.messages).toHaveLength(2);
     expect(body.messages[0].content.startsWith("You are helpful.")).toBe(true);
-    expect(body.messages[0].content.endsWith(OPENCODE_ENV_MARKER)).toBe(true);
+    expect(body.messages[0].content.endsWith("</env>")).toBe(true);
   });
 
+  // Block arrays keep their shape: the marker joins the last text block.
   it("appends the env block to a part array system message", () => {
     const body = chatBody({
-      messages: [{ role: "system", content: [{ type: "text", text: "You are helpful." }] }, { role: "user", content: "hi" }],
+      messages: [
+        { role: "system", content: [{ type: "text", text: "You are helpful." }] },
+        { role: "user", content: "hi" },
+      ],
     });
-    applyFingerprintSystemPrompt(body);
-    expect(body.messages[0].content).toHaveLength(2);
-    expect(body.messages[0].content[1]).toEqual({ type: "text", text: OPENCODE_ENV_MARKER });
+    applyEnvFingerprint(body, false);
+    expect(body.messages[0].content).toHaveLength(1);
+    expect(body.messages[0].content[0].text.startsWith("You are helpful.")).toBe(true);
+    expect(body.messages[0].content[0].text).toContain("<env>");
+    expect(body.messages[0].content[0].text.endsWith("</env>")).toBe(true);
   });
 
   it("appends the env block to a claude system string", () => {
     const body = { system: "You are Claude Code.", messages: [{ role: "user", content: "hi" }] };
-    applyFingerprintSystemPrompt(body);
+    expect(applyEnvFingerprint(body, false, { claude: true })).toBe(true);
     expect(body.system.startsWith("You are Claude Code.")).toBe(true);
-    expect(body.system.endsWith(OPENCODE_ENV_MARKER)).toBe(true);
+    expect(body.system.endsWith("</env>")).toBe(true);
     expect(body.messages).toHaveLength(1);
   });
 
   it("appends the env block to a claude system array", () => {
-    const body = { system: [{ type: "text", text: "You are Claude Code." }], messages: [{ role: "user", content: "hi" }] };
-    applyFingerprintSystemPrompt(body);
-    expect(body.system).toHaveLength(2);
-    expect(body.system[1].text).toBe(OPENCODE_ENV_MARKER);
+    const body = {
+      system: [{ type: "text", text: "You are Claude Code." }],
+      messages: [{ role: "user", content: "hi" }],
+    };
+    applyEnvFingerprint(body, false, { claude: true });
+    expect(body.system).toHaveLength(1);
+    expect(body.system[0].text.startsWith("You are Claude Code.")).toBe(true);
+    expect(body.system[0].text).toContain("<env>");
   });
 
-  it("uses instructions for Responses bodies with input", () => {
+  it("uses instructions for Responses bodies", () => {
     const body = responsesBody();
-    applyFingerprintSystemPrompt(body);
-    expect(body.instructions).toBe(OPENCODE_ENV_MARKER);
+    applyEnvFingerprint(body, true);
+    expect(body.instructions).toContain("<env>");
     expect(body.input).toHaveLength(1);
   });
 
   it("appends the env block to existing Responses instructions", () => {
     const body = responsesBody({ instructions: "You are Codex." });
-    applyFingerprintSystemPrompt(body);
+    applyEnvFingerprint(body, true);
     expect(body.instructions.startsWith("You are Codex.")).toBe(true);
-    expect(body.instructions.endsWith(OPENCODE_ENV_MARKER)).toBe(true);
+    expect(body.instructions.endsWith("</env>")).toBe(true);
   });
 
+  // A real opencode client already sends the marker; doubling it would alter
+  // the prompt.
   it("leaves an existing env block untouched and stays idempotent", () => {
-    const body = chatBody({ messages: [{ role: "system", content: `Custom prompt\n\n${OPENCODE_ENV_MARKER}` }, { role: "user", content: "hi" }] });
-    applyFingerprintSystemPrompt(body);
-    applyFingerprintSystemPrompt(body);
+    const existing = "Custom prompt\n\n<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n</env>";
+    const body = chatBody({ messages: [{ role: "system", content: existing }, { role: "user", content: "hi" }] });
+    expect(applyEnvFingerprint(body, false)).toBe(false);
+    expect(body.messages[0].content).toBe(existing);
     expect(envCount(body.messages[0].content)).toBe(1);
-    expect(body.messages).toHaveLength(2);
   });
 
   it("does not touch a claude array that already holds an env block", () => {
-    const body = { system: [{ type: "text", text: "You are Claude Code." }, { type: "text", text: OPENCODE_ENV_MARKER }], messages: [] };
-    applyFingerprintSystemPrompt(body);
+    const body = {
+      system: [
+        { type: "text", text: "You are Claude Code." },
+        { type: "text", text: "<env>\n  Working directory: /workspace\n</env>" },
+      ],
+      messages: [],
+    };
+    expect(applyEnvFingerprint(body, false, { claude: true })).toBe(false);
     expect(body.system).toHaveLength(2);
   });
 
   it("ignores nullish and non-object bodies", () => {
-    expect(() => applyFingerprintSystemPrompt(null)).not.toThrow();
-    expect(() => applyFingerprintSystemPrompt(undefined)).not.toThrow();
-    expect(() => applyFingerprintSystemPrompt("text")).not.toThrow();
+    expect(() => applyEnvFingerprint(null, false)).not.toThrow();
+    expect(() => applyEnvFingerprint(undefined, false)).not.toThrow();
+    expect(() => applyEnvFingerprint("text", false)).not.toThrow();
+    expect(applyEnvFingerprint(null, false)).toBe(false);
   });
 });
 
@@ -129,6 +139,7 @@ describe("OpenCodeExecutor env marker wiring", () => {
     expect(system).toHaveLength(1);
     expect(system[0].content).toContain("<env>");
     expect(system[0].content).toContain(WORKDIR_LINE);
+    expect(system[0].content).toContain(ROOT_LINE);
     expect(system[0].content).toContain("</env>");
   });
 

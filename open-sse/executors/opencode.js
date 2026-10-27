@@ -6,22 +6,25 @@ import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
-import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { applyFingerprintTools } from "../utils/opencodeFingerprint.js";
+import { opencodeTlsFetch, OpencodeTlsUnavailableError } from "../services/opencodeTlsClient.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
-  resolveEgress,
-  markEgressCooling,
+  DIRECT_EGRESS_ID,
+  clearEgressCooldown,
+  describeEgress,
   getEgressCooldown,
   hasActiveDirectCooldown,
   hasAlternateEgresses,
-  selectAlternateProxy,
+  isEgressProbeDue,
+  markEgressCooling,
   parseRetryAfterMs,
+  resolveEgress,
+  selectAlternateProxy,
   syntheticRateLimitResponse,
-  describeEgress,
-  DIRECT_EGRESS_ID,
 } from "../utils/egress.js";
-import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
+import { normalizeString, resolveEffectiveProxyUrl } from "../utils/proxyResolution.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -39,9 +42,6 @@ const SESSION_HEADER = "x-opencode-session";
 const SESSION_FIELD = "_opencodeSession";
 export const OPENCODE_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-// chatCore falls back to `crypto.randomUUID() + Date.now()` for providerSessionId
-// when the downstream request carries no session hint. Treating that synthetic
-// seed as a real conversation hint gives every request its own upstream session.
 const SYNTHETIC_SESSION_SEED_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\d{13}$/i;
 
 function hasValidOpencodeVersion(ua) {
@@ -71,7 +71,6 @@ function unstableRandom() {
 // Upstream decodes it and rejects a non-small counter with 403 FreeTierError
 // (live probes: counter 0–16 pass, >=100 fail), so the counter must stay real.
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-const SESSION_COUNTER_MAX = 16;
 
 function descendingTimeHex(time, counterValue) {
   return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
@@ -84,16 +83,27 @@ export function generateSessionId(timestamp = Date.now()) {
     lastTimestamp = timestamp;
     counter = 0;
   }
-  counter = (counter % SESSION_COUNTER_MAX) + 1;
+  counter++;
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
-// Upstream decodes the session prefix as a timestamp and rejects ids whose clock
-// is far from the request with a 429 FreeUsageLimitError. Mint translated ids from
-// the current clock, then cache per hint + rotation epoch so a conversation keeps
-// one session across turns instead of getting a fresh one every request.
+// Upstream decodes the prefix timestamp and refuses sessions whose time is in
+// the future or older than the free-tier window (live probes 2026-10-26: a
+// Date.now() session passed 10/10 while digest-derived ones passed 1/10). A
+// digest is uniform over 2^36 ms, so most translated ids were refused even
+// though their shape matched. Mint with the current time and memoize per
+// conversation so a conversation keeps one stable, valid session.
 const translatedOpencodeSessions = new Map();
-const MAX_TRANSLATED_SESSIONS = 1000;
+const MAX_TRANSLATED_SESSIONS = 5000;
+const translatedSessionCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of translatedOpencodeSessions) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
+      translatedOpencodeSessions.delete(key);
+    }
+  }
+}, MEMORY_CONFIG.sessionCleanupIntervalMs);
+if (translatedSessionCleanup.unref) translatedSessionCleanup.unref();
 
 export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
@@ -103,11 +113,9 @@ export function translateSessionId(sessionId, clientTool = "", egressId = "", ep
   const existing = translatedOpencodeSessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
-    translatedOpencodeSessions.delete(key);
-    translatedOpencodeSessions.set(key, existing);
     return existing.sessionId;
   }
-  const translated = generateSessionId();
+  const translated = `ses_${descendingTimeHex(Date.now(), 1)}${unstableRandom()}`;
   if (translatedOpencodeSessions.size >= MAX_TRANSLATED_SESSIONS) {
     translatedOpencodeSessions.delete(translatedOpencodeSessions.keys().next().value);
   }
@@ -140,7 +148,6 @@ function nativeSession(headers) {
 // that: one stable canonical session per downstream identity, evicted
 // after MEMORY_CONFIG.sessionTtlMs like the other session stores.
 const stableOpencodeSessions = new Map();
-const opencodeSessionEpochs = new Map();
 const MAX_STABLE_SESSIONS = 1000;
 const stableSessionCleanup = setInterval(() => {
   const now = Date.now();
@@ -173,6 +180,10 @@ function identityKey(credentials) {
   }
   return "opencode:default";
 }
+
+// A session is bound to the address that opened it, so the rotation epoch is
+// tracked per egress.
+const opencodeSessionEpochs = new Map();
 
 function sessionScopeKey(credentials, egressId) {
   return `${identityKey(credentials)}\0${egressId || DIRECT_EGRESS_ID}`;
@@ -270,6 +281,8 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     }
   }
 
+  // chatCore seeds providerSessionId with crypto.randomUUID() + Date.now() when
+  // the request carries no session of its own; that is not a conversation.
   const seed = typeof providerSessionId === "string" && SYNTHETIC_SESSION_SEED_RE.test(providerSessionId.trim())
     ? null
     : providerSessionId;
@@ -292,6 +305,28 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   }
 
   return stableSessionId(credentials, egressId);
+}
+
+function cloneRequestBody(body) {
+  if (body === null || typeof body !== "object") return body;
+  if (typeof structuredClone === "function") {
+    try { return structuredClone(body); } catch { }
+  }
+  try {
+    return JSON.parse(JSON.stringify(body));
+  } catch {
+    return body;
+  }
+}
+
+// transformRequest mutates the body in place, so a retry needs a copy taken
+// before the first attempt.
+async function readResponseText(response) {
+  try {
+    return await response.clone().text();
+  } catch {
+    return "";
+  }
 }
 
 function normalizeResponsesTools(body) {
@@ -390,26 +425,6 @@ function dropAdaptiveReasoningEffort(body) {
   if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
 }
 
-function cloneRequestBody(body) {
-  if (body === null || typeof body !== "object") return body;
-  if (typeof structuredClone === "function") {
-    try { return structuredClone(body); } catch { }
-  }
-  try {
-    return JSON.parse(JSON.stringify(body));
-  } catch {
-    return body;
-  }
-}
-
-async function readResponseText(response) {
-  try {
-    return await response.clone().text();
-  } catch {
-    return "";
-  }
-}
-
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
@@ -460,19 +475,21 @@ export class OpenCodeExecutor extends BaseExecutor {
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
       dropAdaptiveReasoningEffort(body);
-      applyFingerprintTools(body, false);
+      applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
-    applyFingerprintSystemPrompt(body);
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
+  // The free gate keys on the TLS ClientHello, so the request has to leave on
+  // the impersonating client; without wreq-js it falls back to native fetch.
+  // A 429 cools that egress, retires its session, and retries once elsewhere.
   async execute(args) {
-    const { model, stream, credentials, log } = args;
+    const { model, stream, log } = args;
     let proxyOptions = args.proxyOptions || null;
 
     let targetUrl;
     try {
-      targetUrl = this.buildUrl(model, stream, 0, credentials);
+      targetUrl = this.buildUrl(model, stream, 0, args.credentials);
     } catch {
       targetUrl = this.config.baseUrl;
     }
@@ -486,14 +503,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       });
     } catch (error) {
       log?.debug?.("EGRESS", `resolve failed, failing open: ${error.message}`);
-      egress = {
-        id: DIRECT_EGRESS_ID,
-        kind: "direct",
-        confirmed: false,
-        ip: null,
-        proxyUrl: null,
-        relayUrl: null,
-      };
+      egress = { id: DIRECT_EGRESS_ID, kind: "direct", confirmed: false, ip: null, proxyUrl: null, relayUrl: null };
     }
 
     const cooldown = getEgressCooldown(egress);
@@ -506,12 +516,13 @@ export class OpenCodeExecutor extends BaseExecutor {
         );
         proxyOptions = selection.alternate.proxyOptions;
         egress = selection.alternate.egress;
+      } else if (isEgressProbeDue(egress)) {
+        // Nothing else to try, so verify the refusal instead of trusting it:
+        // one real request now beats hours of answering 429 from cache.
+        log?.debug?.("EGRESS", `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s — probing`);
       } else {
         const retryAfterMs = Math.min(cooldown.retryAfterMs, selection.earliestCooldownMs ?? Infinity);
-        log?.warn?.(
-          "EGRESS",
-          `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s; no alternate — local 429`
-        );
+        log?.warn?.("EGRESS", `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s; no alternate — local 429`);
         return {
           response: syntheticRateLimitResponse(retryAfterMs),
           url: targetUrl,
@@ -524,9 +535,21 @@ export class OpenCodeExecutor extends BaseExecutor {
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
     const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
 
-    let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+    const run = (credentials, options, body) => super.execute({
+      ...args,
+      body,
+      credentials,
+      proxyOptions: options,
+    });
 
-    if (!result?.response || result.response.status !== 429) return result;
+    const egressId = egress.id;
+    const result = await run(prepared, proxyOptions, args.body);
+    if (!result?.response) return result;
+    if (result.response.status !== 429) {
+      // Any non-429 answer proves the egress is healthy again.
+      clearEgressCooldown(egressId);
+      return result;
+    }
 
     const bodyText = await readResponseText(result.response);
     const retryAfterMs = parseRetryAfterMs(result.response.headers, bodyText);
@@ -544,7 +567,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
     const retrySameEgress = rotated && egress.kind === "direct";
 
-    if (!selection.alternate && !retrySameEgress) {
+    if (!selection.alternate) {
       const cooling = markEgressCooling(egress, retryAfterMs);
       if (cooling) {
         log?.warn?.(
@@ -552,10 +575,8 @@ export class OpenCodeExecutor extends BaseExecutor {
           `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
         );
       }
-      return result;
-    }
-
-    if (selection.alternate) {
+      if (!retrySameEgress) return result;
+    } else {
       const cooling = markEgressCooling(egress, retryAfterMs);
       if (cooling) {
         log?.warn?.(
@@ -573,29 +594,37 @@ export class OpenCodeExecutor extends BaseExecutor {
       egressId: retryEgress.id,
     });
 
-    log?.warn?.(
-      "EGRESS",
-      `429 on ${describeEgress(egress)} → retry once on ${describeEgress(retryEgress)}`
-    );
+    log?.warn?.("EGRESS", `429 on ${describeEgress(egress)} → retry once on ${describeEgress(retryEgress)}`);
 
-    const retryResult = await super.execute({
-      ...args,
-      body: retryBody || args.body,
-      credentials: retryCredentials,
-      proxyOptions: retryProxyOptions,
-    });
-
-    if (retryResult?.response?.status === 429) {
+    const retryResult = await run(retryCredentials, retryProxyOptions, retryBody || args.body);
+    if (!retryResult?.response) return retryResult;
+    if (retryResult.response.status === 429) {
       const retryText = await readResponseText(retryResult.response);
       markEgressCooling(retryEgress, parseRetryAfterMs(retryResult.response.headers, retryText));
+    } else {
+      clearEgressCooldown(retryEgress.id);
     }
     return retryResult;
   }
 
+  // The impersonating client carries the proxy hop itself and speaks http(s)
+  // CONNECT and SOCKS natively. A relay rewrites headers, so it stays shared.
   async fetchUpstream(url, options, proxyOptions = null) {
-    const response = await fetchViaTransport(url, options, proxyOptions);
-    if (response) return response;
-    return proxyAwareFetch(url, options, proxyOptions);
+    if (normalizeString(proxyOptions?.vercelRelayUrl)) {
+      return proxyAwareFetch(url, options, proxyOptions);
+    }
+    const { url: proxyUrl } = resolveEffectiveProxyUrl(url, proxyOptions);
+    try {
+      return await opencodeTlsFetch(url, {
+        method: options.method,
+        headers: options.headers,
+        body: options.body,
+      }, { signal: options.signal, proxyUrl: proxyUrl || "" });
+    } catch (error) {
+      if (!(error instanceof OpencodeTlsUnavailableError)) throw error;
+      // Keep the request alive without the impersonated handshake.
+      return proxyAwareFetch(url, options, proxyOptions);
+    }
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

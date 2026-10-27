@@ -6,10 +6,45 @@
 
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { getAntigravityUsage } from "open-sse/services/usage/google.js";
+import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import * as log from "../utils/logger.js";
 
 // In-memory cache: connectionId → { [modelId]: { remainingPercentage, resetAt } }
 const quotaCache = new Map();
+
+// A quota reading is a snapshot, not a promise. Upstream reports the reset of
+// the window it just counted against, which can be days out; trusting it means
+// answering every request from cache until then even after the limit lifts.
+// Hold a reading for at most this long, then read the quota again: an exhausted
+// window is re-confirmed with one cheap call, a recovered one is usable again
+// within minutes instead of whenever the advertised reset lands.
+const QUOTA_RECHECK_MS = Math.min(5 * 60_000, MAX_RATE_LIMIT_COOLDOWN_MS);
+
+/**
+ * Stamp a freshly-read quota entry with how long it may block.
+ *
+ * `resetAt` stays the honest upstream number (callers report it to the client);
+ * `effectiveResetAt` is what the pre-filter compares against, capped at
+ * observedAt + QUOTA_RECHECK_MS so no single reading can park the pair for days.
+ */
+function stampEntry(entry, now = Date.now()) {
+  if (!entry || typeof entry !== "object") return entry;
+  const until = Math.min(
+    entry.resetAt ? new Date(entry.resetAt).getTime() : Infinity,
+    now + QUOTA_RECHECK_MS
+  );
+  if (!Number.isFinite(until)) return entry;
+  return { ...entry, effectiveResetAt: new Date(until).toISOString() };
+}
+
+/** True while this cached entry still blocks the pair. */
+function isBlocked(entry, now = Date.now()) {
+  if (!entry || typeof entry.remainingPercentage !== "number" || entry.remainingPercentage > 0) return false;
+  const until = entry.effectiveResetAt || entry.resetAt;
+  if (!until) return false;
+  return new Date(until).getTime() > now;
+}
+
 // Track last refresh per connection to avoid hammering
 const lastRefreshAt = new Map();
 // In-flight refresh promises — dedup concurrent 409/429 bursts
@@ -116,20 +151,14 @@ export function getAntigravityModelQuota(quotas, model) {
   const exhausted = [];
 
   for (const c of candidates) {
-    if (c && typeof c === "object" && typeof c.remainingPercentage === "number" && c.remainingPercentage <= 0) {
-      if (c.resetAt) {
-        const resetMs = new Date(c.resetAt).getTime();
-        if (resetMs > now) {
-          exhausted.push({ ...c, resetMs });
-        }
-      } else {
-        exhausted.push({ ...c, resetMs: 0 });
-      }
-    }
+    if (!isBlocked(c, now)) continue;
+    const until = c.effectiveResetAt || c.resetAt;
+    exhausted.push({ ...c, resetMs: until ? new Date(until).getTime() : 0 });
   }
 
   // If any bucket is exhausted (0%), the model is exhausted.
-  // Use the longest (latest) resetAt so we do not unblock prematurely.
+  // Use the latest effective reset so we do not unblock prematurely, but the
+  // real upstream reset is kept for reporting.
   if (exhausted.length > 0) {
     exhausted.sort((a, b) => b.resetMs - a.resetMs);
     const primary = exhausted[0];
@@ -138,6 +167,7 @@ export function getAntigravityModelQuota(quotas, model) {
       total: primary.total ?? 1000,
       remainingPercentage: 0,
       resetAt: primary.resetAt,
+      effectiveResetAt: primary.effectiveResetAt || primary.resetAt,
       displayName: primary.displayName || cleanModel,
     };
   }
@@ -228,8 +258,12 @@ async function _doRefresh(connectionId, accessToken, providerSpecificData, now) 
     // Update in-memory cache. Caller logs CACHE_BLOCK only if requested model is exhausted.
     // Strike blocks are re-asserted after every refresh so an optimistic
     // upstream reading cannot resurrect a pair we just circuit-broke.
-    quotaCache.set(connectionId, applyActiveStrikeBlocks(connectionId, usage.quotas));
-
+    // Every entry from upstream is stamped now, so none of them can block for
+    // longer than QUOTA_RECHECK_MS without being re-read.
+    const now = Date.now();
+    const stamped = {};
+    for (const [key, entry] of Object.entries(usage.quotas)) stamped[key] = stampEntry(entry, now);
+    quotaCache.set(connectionId, applyActiveStrikeBlocks(connectionId, stamped));
     return usage.quotas;
   } catch (e) {
     log.warn("AG_QUOTA", `${connectionId.slice(0, 8)} | refresh failed: ${e.message}`);
@@ -279,6 +313,8 @@ export async function handleAntigravityQuotaError(connectionId, status, model, a
       quotaCache.set(connectionId, cached);
       strikeBlocks.set(key, blockedUntil);
       return blockedUntil;
+
+
     }
     return null;
   }
@@ -290,9 +326,11 @@ export async function handleAntigravityQuotaError(connectionId, status, model, a
   const resetMs = new Date(quota.resetAt).getTime();
   if (resetMs <= Date.now()) return null;
 
-  // Cache-block the requested model under its model name
+  // Cache-block the requested model under its model name. The entry blocks for
+  // at most QUOTA_RECHECK_MS (see stampEntry), so the pair is re-checked well
+  // before the advertised reset instead of staying parked until then.
   const cached = quotaCache.get(connectionId) || {};
-  cached[model] = { remainingPercentage: 0, resetAt: quota.resetAt };
+  cached[model] = stampEntry({ remainingPercentage: 0, resetAt: quota.resetAt });
   quotaCache.set(connectionId, cached);
 
   log.warn("AG_QUOTA", `${connectionId.slice(0, 8)} | UPSTREAM_${status} ${model} — quota exhausted; CACHE_BLOCK until ${quota.resetAt}`);
